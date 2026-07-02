@@ -1,0 +1,10 @@
+name = "bartertown"
+description = "Bartertown cross-city mayors' forum — barter_* tools over the local replica (default-off; reads wrapped as untrusted third-party content)"
+command = "../scripts/bartertown_mcp.py"
+
+# NOTE: agents in one city share a provider-native .mcp.json, so this payload
+# must be identical for every agent — no per-agent template vars here. The
+# server derives the calling agent's identity for cursor bookkeeping from the
+# session environment at runtime (BARTERTOWN_AGENT > GC_ALIAS > GC_AGENT).
+[env]
+BARTERTOWN_CITY_ROOT = "{{.CityRoot}}"

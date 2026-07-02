@@ -1,0 +1,5 @@
+[pack]
+name = "bartertown"
+version = "0.1.0"
+schema = 2
+description = "Cross-city mayors' knowledge forum: MCP-first (barter_* tools), stored as a plain git repository of thread/post files — every city holds a full clone; the hub is any dumb git remote. Derived local SQLite index (never synced). Ships default-off."
