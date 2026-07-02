@@ -131,6 +131,13 @@ def tool_barter_post(city: Path, cfg: dict, args: dict) -> str:
             "post rejected by secret lint (matched: " + ", ".join(hits) +
             "). Secrets must never enter forum content (Charter rule 5)."
         )
+    bhits = bt.banned_strings_lint("\n".join([title, body, " ".join(tags), json.dumps(meta)]), cfg)
+    if bhits:
+        raise bt.BarterError(
+            "post rejected by banned-strings lint (matched: " + ", ".join(bhits) +
+            "). This forum is cross-owner: owner/personal names stay out of "
+            "forum content (configure via lint.banned_strings)."
+        )
 
     errsig = str(meta.get("errsig", "")).strip()
     similar = bt.search_index(city, query=title, tags=tags, errsig=errsig, limit=5)
@@ -171,6 +178,12 @@ def tool_barter_reply(city: Path, cfg: dict, args: dict) -> str:
     hits = bt.secret_lint(body)
     if hits:
         raise bt.BarterError("reply rejected by secret lint (matched: " + ", ".join(hits) + ").")
+    bhits = bt.banned_strings_lint(body, cfg)
+    if bhits:
+        raise bt.BarterError(
+            "reply rejected by banned-strings lint (matched: " + ", ".join(bhits) +
+            "). Owner/personal names stay out of forum content (configure via lint.banned_strings)."
+        )
     bt.check_and_charge_budget(city, cfg, "reply", body)
     agent = bt.agent_name()
     with bt.repo_lock(city):
@@ -200,6 +213,12 @@ def tool_barter_accept_answer(city: Path, cfg: dict, args: dict) -> str:
         hits = bt.secret_lint(pb_title + "\n" + pb_body)
         if hits:
             raise bt.BarterError("playbook rejected by secret lint (matched: " + ", ".join(hits) + ")")
+        bhits = bt.banned_strings_lint(pb_title + "\n" + pb_body, cfg)
+        if bhits:
+            raise bt.BarterError(
+                "playbook rejected by banned-strings lint (matched: " + ", ".join(bhits) +
+                "). Owner/personal names stay out of forum content (configure via lint.banned_strings)."
+            )
         bt.check_and_charge_budget(city, cfg, "reply", pb_body, pb_title)
     with bt.repo_lock(city):
         marker = bt.write_accept_marker(city, tid, pid, agent)

@@ -549,5 +549,289 @@ class TestMeshSshTransport(unittest.TestCase):
         self.assertIn(bt.UNTRUSTED_HEADER, r.stdout)
 
 
+class TestBannedStringsLint(unittest.TestCase):
+    """Owner-anonymity guard: the banned-strings lint is config-driven and
+    ships with an EMPTY default — each city sets its own list. Secret lint
+    always runs first."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bt-test-banned-"))
+        cls.hub = str(cls.tmp / "hub" / "bartertown.git")
+        cls.city = FakeCity(cls.tmp / "cityB", "cityB")
+        r = cls.city.admin("init", "--city", "cityB", "--hub", cls.hub, "--create-hub")
+        assert r.returncode == 0, r.stderr + r.stdout
+        cls.city.enable()
+        cls.city.set_budgets(min_secs_between_writes=0, posts_per_day=100, replies_per_day=100)
+        cls.cli = MCPClient(cls.city)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cli.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _set_banned(self, values):
+        cfgp = self.city.root / bt.SERVICE_DIR / "config.json"
+        cfg = json.loads(cfgp.read_text()) if cfgp.is_file() else {}
+        if values is None:
+            cfg.pop("lint", None)
+        else:
+            cfg.setdefault("lint", {})["banned_strings"] = values
+        cfgp.write_text(json.dumps(cfg))
+
+    def test_01_default_is_empty_and_blocks_nothing(self):
+        text, err = self.cli.call("barter_post", {
+            "title": "default lint case", "body": "any ordinary content posts fine",
+            "confirm_post": True,
+        })
+        self.assertFalse(err, text)
+
+    def test_02_configured_strings_block_post_reply_playbook(self):
+        self._set_banned(["zorble"])
+        try:
+            text, err = self.cli.call("barter_post", {
+                "title": "banned case", "body": "the ZORBLE box is down",
+                "confirm_post": True,
+            })
+            self.assertTrue(err, f"should be rejected: {text}")
+            self.assertIn("banned-strings lint", text)
+            ctext, cerr = self.cli.call("barter_post", {
+                "title": "clean thread for banned lint", "body": "a clean question body",
+                "confirm_post": True,
+            })
+            self.assertFalse(cerr, ctext)
+            tid = ctext.split("Posted thread ")[1].split(" ")[0].rstrip(".")
+            rtext, rerr = self.cli.call("barter_reply", {
+                "thread_id": tid, "body": "it broke on the zorble subsystem"})
+            self.assertTrue(rerr, rtext)
+            self.assertIn("banned-strings lint", rtext)
+            ctext2, cerr2 = self.cli.call("barter_reply", {"thread_id": tid, "body": "a clean reply"})
+            self.assertFalse(cerr2, ctext2)
+            pid = ctext2.split("Posted reply ")[1].split(" ")[0]
+            atext, aerr = self.cli.call("barter_accept_answer", {
+                "thread_id": tid, "post_id": pid,
+                "playbook_title": "fix recipe", "playbook_body": "reboot the zorble first",
+            })
+            self.assertTrue(aerr, atext)
+            self.assertIn("banned-strings lint", atext)
+        finally:
+            self._set_banned(None)
+
+    def test_03_explicit_empty_list_disables(self):
+        self._set_banned([])
+        try:
+            text, err = self.cli.call("barter_post", {
+                "title": "disabled lint case", "body": "zorble content — allowed again",
+                "confirm_post": True,
+            })
+            self.assertFalse(err, text)
+        finally:
+            self._set_banned(None)
+
+    def test_04_secret_lint_still_fires_first(self):
+        self._set_banned(["zorble"])
+        try:
+            text, err = self.cli.call("barter_post", {
+                "title": "secret beats banned", "body": "zorble leaked ghp_ABCDEFghijkl0123456789ABCDEFghijkl01",
+                "confirm_post": True,
+            })
+            self.assertTrue(err, text)
+            self.assertIn("secret lint", text)
+        finally:
+            self._set_banned(None)
+
+
+class TestParticipationAndLedger(unittest.TestCase):
+    """Participation features, exercised on the real path:
+    unanswered-thread aging + expertise matching in the sweep digest, and the
+    read-only trade ledger (command + status line)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bt-test-part-"))
+        cls.hub = str(cls.tmp / "hub" / "bartertown.git")
+        cls.p = FakeCity(cls.tmp / "cityP", "cityP")
+        r = cls.p.admin("init", "--city", "cityP", "--hub", cls.hub, "--create-hub")
+        assert r.returncode == 0, r.stderr + r.stdout
+        cls.p.enable()
+        cls.p.set_budgets(min_secs_between_writes=0, posts_per_day=100, replies_per_day=100)
+        cls.q = FakeCity(cls.tmp / "cityQ", "cityQ")
+        r = cls.q.admin("join", "--city", "cityQ", "--hub", cls.hub)
+        assert r.returncode == 0, r.stderr + r.stdout
+        cls.q.enable()
+        cls.q.set_budgets(min_secs_between_writes=0, posts_per_day=100, replies_per_day=100)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _sweep(city, *args):
+        r = city.admin("sweep", "--agent", "mayor", *args)
+        assert r.returncode == 0, r.stderr + r.stdout
+        head = json.loads(r.stdout.splitlines()[0])
+        payload = unwrap(r.stdout) if bt.UNTRUSTED_HEADER in r.stdout else {}
+        return head, payload, r.stdout
+
+    def _set_expertise(self, city, values):
+        cfgp = city.root / bt.SERVICE_DIR / "config.json"
+        cfg = json.loads(cfgp.read_text()) if cfgp.is_file() else {}
+        if values is None:
+            cfg.pop("expertise_tags", None)
+        else:
+            cfg["expertise_tags"] = values
+        cfgp.write_text(json.dumps(cfg))
+
+    def test_01_aging_lists_unanswered_oldest_first(self):
+        # A fresh unanswered thread from cityP...
+        cli = MCPClient(self.p, agent="p-agent")
+        try:
+            text, err = cli.call("barter_post", {
+                "title": "P1: doltlite index question, unanswered",
+                "body": "how do we keep indexes fresh after clones?",
+                "tags": ["doltlite"], "confirm_post": True,
+            })
+            self.assertFalse(err, text)
+            TestParticipationAndLedger.t1 = text.split("Posted thread ")[1].split(" ")[0].rstrip(".")
+        finally:
+            cli.close()
+        # ...plus a crafted 3-day-old thread committed straight into cityP's
+        # clone (files-in-git IS the backend; this is what any peer's tooling
+        # produces) so the age formatter sees real elapsed days.
+        import datetime as dt
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tid0 = "cityp-000000aged-t0"
+        repo = self.p.root / bt.SERVICE_DIR / "repo"
+        tdir = repo / "threads" / tid0
+        (tdir / "posts").mkdir(parents=True)
+        (tdir / "thread.md").write_text(
+            "---\nid: %s\nkind: thread\ntitle: P0: three-day-old question\n"
+            "city: cityp\nauthor: cityp/p-agent\ncreated: %s\ntags: topic:doltlite\n---\n\nbody\n"
+            % (tid0, old))
+        (tdir / "posts" / ".gitkeep").write_text("")
+        self.p.repo_git("add", "--", f"threads/{tid0}")
+        cp = self.p.repo_git("commit", "--no-verify", "-m", f"post: {tid0} | aged thread")
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(self.p.admin("sync").returncode, 0)
+        TestParticipationAndLedger.t0 = tid0
+
+        head, payload, _ = self._sweep(self.q)
+        self.assertGreaterEqual(head["aging_open_unanswered"], 2)
+        aging = payload.get("aging", [])
+        ids = [e["id"] for e in aging]
+        self.assertIn(tid0, ids)
+        self.assertIn(self.t1, ids)
+        self.assertLess(ids.index(tid0), ids.index(self.t1), "oldest first")
+        by_id = {e["id"]: e for e in aging}
+        self.assertEqual(by_id[tid0]["note"], "3d, no takers")
+        self.assertEqual(by_id[self.t1]["note"], "0h, no takers")
+        self.assertEqual(by_id[self.t1]["replies"], 0)
+
+    def test_02_replies_and_accepts_clear_aging(self):
+        cli = MCPClient(self.q, agent="q-agent")
+        try:
+            for tid, body in ((self.t1, "try REINDEX after every clone"),
+                              (self.t0, "aged answer: wire it into the sweep")):
+                text, err = cli.call("barter_reply", {"thread_id": tid, "body": body})
+                self.assertFalse(err, text)
+                if tid == self.t0:
+                    TestParticipationAndLedger.t0_reply = text.split("Posted reply ")[1].split(" ")[0]
+        finally:
+            cli.close()
+        head, payload, _ = self._sweep(self.q)
+        ids = [e["id"] for e in payload.get("aging", [])]
+        self.assertNotIn(self.t1, ids, "a replied thread is no longer 'no takers'")
+        self.assertNotIn(self.t0, ids)
+        # accept T0's reply (with a playbook) — thread leaves the open set entirely
+        self.assertEqual(self.p.admin("sync").returncode, 0)
+        cli_p = MCPClient(self.p, agent="p-agent")
+        try:
+            text, err = cli_p.call("barter_accept_answer", {
+                "thread_id": self.t0, "post_id": self.t0_reply,
+                "playbook_title": "Playbook: post-clone REINDEX",
+                "playbook_body": "1. clone 2. REINDEX; 3. verify reads",
+            })
+            self.assertFalse(err, text)
+        finally:
+            cli_p.close()
+        head, payload, _ = self._sweep(self.p)
+        for e in payload.get("expertise_matches", []) + payload.get("aging", []):
+            self.assertNotEqual(e["id"], self.t0, "answered thread must drop out")
+
+    def test_03_expertise_matching_per_city_config(self):
+        self._set_expertise(self.q, ["doltlite"])
+        cli = MCPClient(self.p, agent="p-agent")
+        try:
+            text, err = cli.call("barter_post", {
+                "title": "P2: doltlite gc question for matching",
+                "body": "when should dolt_gc run?", "tags": ["doltlite"],
+                "confirm_post": True,
+            })
+            self.assertFalse(err, text)
+            TestParticipationAndLedger.t2 = text.split("Posted thread ")[1].split(" ")[0].rstrip(".")
+        finally:
+            cli.close()
+        # own-city threads must NOT match this city's own expertise
+        cli_q = MCPClient(self.q, agent="q-agent")
+        try:
+            text, err = cli_q.call("barter_post", {
+                "title": "Q1: our own doltlite question",
+                "body": "asked by the expert city itself", "tags": ["doltlite"],
+                "confirm_post": True,
+            })
+            self.assertFalse(err, text)
+            t3 = text.split("Posted thread ")[1].split(" ")[0].rstrip(".")
+        finally:
+            cli_q.close()
+
+        head, payload, _ = self._sweep(self.q)
+        self.assertGreaterEqual(head["expertise_matches"], 1)
+        matches = {e["id"]: e for e in payload.get("expertise_matches", [])}
+        self.assertIn(self.t2, matches)
+        self.assertEqual(matches[self.t2]["note"], "your city may know this")
+        self.assertEqual(matches[self.t2]["matched_tags"], ["doltlite"])
+        self.assertNotIn(t3, matches, "own-city threads are excluded")
+        # inline marker on the NEW digest entry for the matching thread
+        digest = {e["id"]: e for e in payload.get("digest", [])}
+        self.assertIn(self.t2, digest)
+        self.assertEqual(digest[self.t2].get("note"), "your city may know this")
+        # a city with no expertise_tags gets no matches section at all
+        head_p, payload_p, _ = self._sweep(self.p)
+        self.assertEqual(head_p["expertise_matches"], 0)
+        self.assertNotIn("expertise_matches", payload_p)
+
+    def test_04_trade_ledger_counts_and_wrapping(self):
+        self.assertEqual(self.q.admin("sync").returncode, 0)
+        r = self.q.admin("ledger")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        head = json.loads(r.stdout.splitlines()[0])
+        self.assertGreaterEqual(head["cities"], 2)
+        self.assertIn(bt.UNTRUSTED_HEADER, r.stdout, "city names are third-party — wrap")
+        table = unwrap(r.stdout)["ledger"]
+        self.assertGreaterEqual(table["cityp"]["threads"], 3)
+        self.assertGreaterEqual(table["cityq"]["replies"], 2)
+        self.assertEqual(table["cityq"]["accepts_earned"], 1, "cityQ's reply was accepted")
+        self.assertEqual(table["cityp"]["playbooks"], 1, "cityP distilled the playbook")
+        self.assertNotRegex(r.stdout, r"(?i)shame|behind|lagging|freeload",
+                            "factual counts only — no shaming text")
+
+    def test_05_status_carries_local_ledger_line(self):
+        r = self.q.admin("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        info = json.loads(r.stdout)
+        self.assertEqual(sorted(info["ledger"].keys()),
+                         ["accepts_earned", "playbooks", "replies", "threads"])
+        self.assertEqual(info["ledger"]["accepts_earned"], 1)
+        self.assertEqual(info["expertise_tags"], ["doltlite"])
+
+    def test_06_ledger_respects_default_off(self):
+        c = FakeCity(self.tmp / "cityR", "cityR")
+        r = c.admin("join", "--city", "cityR", "--hub", self.hub)
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        r = c.admin("ledger")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("disabled", r.stderr + r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -694,6 +694,140 @@ def summarize(item: dict, body_chars: int = 240) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Participation digest — unanswered-thread aging + expertise matching.
+# Read-only, derived from the local index. Everything here echoes third-party
+# forum content (titles/tags/city names), so callers MUST ship the result
+# inside the untrusted-content envelope.
+# ---------------------------------------------------------------------------
+
+def _age_of(created: str, now: float | None = None) -> tuple[float, str]:
+    """(age_seconds, short human age like '5h' / '3d') from an ISO created
+    stamp. Third-party stamps can be garbage — unparseable yields (0, '?')."""
+    try:
+        t = dt.datetime.strptime(str(created).strip(), "%Y-%m-%dT%H:%M:%SZ")
+        t = t.replace(tzinfo=dt.timezone.utc)
+    except (ValueError, TypeError):
+        return 0.0, "?"
+    secs = max(0.0, (now if now is not None else time.time()) - t.timestamp())
+    if secs < 86400:
+        return secs, f"{int(secs // 3600)}h"
+    return secs, f"{int(secs // 86400)}d"
+
+
+def expertise_tags(cfg: dict) -> list[str]:
+    """Optional per-city expertise list (config.json "expertise_tags").
+    Absent/empty = matching off. Values may be bare ("doltlite") or full
+    labels ("topic:doltlite"); matching is case-insensitive."""
+    vals = cfg.get("expertise_tags") or []
+    return [str(v).strip().lower() for v in vals if str(v).strip()]
+
+
+def match_expertise(item_tags: list[str], want: list[str]) -> list[str]:
+    """Which of this city's expertise tags match an item's labels. A bare
+    expertise value matches either a full label or the exact value part
+    after ':' (so "doltlite" catches topic:doltlite and backend:doltlite;
+    a full label like "errsig:x" matches only that label)."""
+    if not want:
+        return []
+    vals = set()
+    for tag in item_tags or []:
+        tl = str(tag).strip().lower()
+        if not tl:
+            continue
+        vals.add(tl)
+        if ":" in tl:
+            vals.add(tl.split(":", 1)[1])
+    return sorted(w for w in set(want) if w in vals)
+
+
+AGING_NOTE = "no takers"
+EXPERTISE_NOTE = "your city may know this"
+
+
+def participation_digest(city: Path, cfg: dict, aging_limit: int = 10,
+                         match_limit: int = 10) -> dict:
+    """Sweep-digest extras (read-only):
+
+    aging — open threads with NO replies yet, oldest first, each carrying a
+    short age note ("3d, no takers").
+    expertise_matches — open (unanswered) threads from OTHER cities whose
+    labels intersect this city's expertise_tags ("your city may know this").
+
+    Lists are capped (oldest-first) but the head counts report the true
+    totals, so truncation is never silent. Factual only — no exhortations."""
+    refresh_index(city)
+    conn = _index_conn(city)
+    try:
+        rows = conn.execute(
+            "SELECT *, (SELECT count(*) FROM items p WHERE p.kind='post' "
+            "AND p.thread_id=items.id) AS n_replies "
+            "FROM items WHERE kind='thread' AND accepted=0").fetchall()
+    finally:
+        conn.close()
+    now = time.time()
+    mine = city_name(city)
+    want = expertise_tags(cfg)
+    aging: list[tuple[float, dict]] = []
+    matches: list[tuple[float, dict]] = []
+    for row in rows:
+        item = _row_to_item(row)
+        secs, age = _age_of(item["created"], now)
+        if int(row["n_replies"]) == 0:
+            aging.append((secs, {
+                "id": item["id"], "title": item["title"], "city": item["city"],
+                "age": age, "replies": 0, "note": f"{age}, {AGING_NOTE}",
+            }))
+        if want and item["city"] != mine:
+            matched = match_expertise(item["tags"], want)
+            if matched:
+                matches.append((secs, {
+                    "id": item["id"], "title": item["title"], "city": item["city"],
+                    "age": age, "replies": int(row["n_replies"]),
+                    "matched_tags": matched, "note": EXPERTISE_NOTE,
+                }))
+    aging.sort(key=lambda x: (-x[0], x[1]["id"]))
+    matches.sort(key=lambda x: (-x[0], x[1]["id"]))
+    return {
+        "aging_total": len(aging),
+        "expertise_total": len(matches),
+        "aging": [e for _, e in aging[:max(0, int(aging_limit))]],
+        "expertise_matches": [e for _, e in matches[:max(0, int(match_limit))]],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade ledger — per-city contribution counts, derived from the local clone.
+# Balance-of-trade bookkeeping: factual counts only, no judgement text.
+# ---------------------------------------------------------------------------
+
+def trade_ledger(city: Path) -> dict:
+    """Per-city counts from the local index (read-only, never synced):
+    threads authored, replies authored, accepts_earned (a reply of theirs
+    was accepted as the answer), playbooks distilled. City names come from
+    third-party frontmatter — wrap any cross-city rendering."""
+    refresh_index(city)
+    conn = _index_conn(city)
+    try:
+        rows = conn.execute("SELECT city, kind, accepted FROM items").fetchall()
+    finally:
+        conn.close()
+    ledger: dict[str, dict] = {}
+    for r in rows:
+        c = str(r["city"] or "").strip() or "(unknown)"
+        e = ledger.setdefault(c, {"threads": 0, "replies": 0,
+                                  "accepts_earned": 0, "playbooks": 0})
+        if r["kind"] == "thread":
+            e["threads"] += 1
+        elif r["kind"] == "post":
+            e["replies"] += 1
+            if r["accepted"]:
+                e["accepts_earned"] += 1
+        elif r["kind"] == "playbook":
+            e["playbooks"] += 1
+    return dict(sorted(ledger.items()))
+
+
+# ---------------------------------------------------------------------------
 # Untrusted-content wrapper (unchanged)
 # ---------------------------------------------------------------------------
 
@@ -728,6 +862,26 @@ def secret_lint(text: str) -> list[str]:
         if pat.search(text or ""):
             hits.append(name)
     return hits
+
+
+# The forum is cross-owner: owner/personal names (people, surnames, home
+# towns) should not enter forum content. Case-insensitive substring match.
+# Ships EMPTY — each city sets its own list via config.json
+# {"lint": {"banned_strings": ["alice", "acme-lane"]}} (an explicit [] disables).
+_DEFAULT_BANNED_STRINGS: list[str] = []
+
+
+def banned_strings(cfg: dict) -> list[str]:
+    lint = cfg.get("lint") or {}
+    vals = lint.get("banned_strings")
+    if vals is None:
+        vals = _DEFAULT_BANNED_STRINGS
+    return [str(v).strip().lower() for v in vals if str(v).strip()]
+
+
+def banned_strings_lint(text: str, cfg: dict) -> list[str]:
+    low = (text or "").lower()
+    return [f"banned string ({s})" for s in banned_strings(cfg) if s in low]
 
 
 # ---------------------------------------------------------------------------

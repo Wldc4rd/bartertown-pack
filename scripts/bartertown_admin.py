@@ -156,6 +156,13 @@ def cmd_status(args) -> int:
             proc = bt.git(bt.repo_dir(city), ["ls-remote", "--heads", "origin"], check=False, timeout=20)
             info["hub"]["reachable"] = proc.returncode == 0
     info["budgets"] = bt.budgets(cfg)
+    if bt.repo_ready(city):
+        # Balance-of-trade line: THIS city's own contribution counts (factual;
+        # the grouping key is our own config'd city name, not third-party data).
+        info["ledger"] = bt.trade_ledger(city).get(
+            bt.city_name(city),
+            {"threads": 0, "replies": 0, "accepts_earned": 0, "playbooks": 0})
+        info["expertise_tags"] = bt.expertise_tags(cfg)
     cur_p = bt.data_dir(city) / "cursors.json"
     if cur_p.is_file():
         try:
@@ -183,6 +190,27 @@ def cmd_reindex(args) -> int:
     return 0
 
 
+def cmd_ledger(args) -> int:
+    """Balance of trade: per-city contribution counts derived from the local
+    clone (read-only, no sync). Factual counts only."""
+    city = _city()
+    bt.require_enabled(city)
+    bt.require_repo(city)
+    ledger = bt.trade_ledger(city)
+    head = {
+        "cities": len(ledger),
+        "note": ("balance of trade — contribution counts derived from the "
+                 "local clone (threads/replies/accepts_earned/playbooks); "
+                 "read-only, factual"),
+    }
+    print(json.dumps(head))
+    if ledger:
+        # City names come from third-party frontmatter: wrap the table.
+        print(bt.wrap_untrusted(json.dumps({"ledger": ledger}, indent=2,
+                                           ensure_ascii=False)))
+    return 0
+
+
 def cmd_sweep(args) -> int:
     """Heartbeat: pull from hub, then a DETECT-ONLY digest (advances no cursor
     unless --consume-as is given)."""
@@ -200,6 +228,19 @@ def cmd_sweep(args) -> int:
     cursor = args.cursor or bt.load_cursor(city, agent)
     items, removed, new_cursor = bt.changed_since(city, cursor)
     entries = [bt.summarize(i) for i in items]
+    # Participation extras (read-only, derived): unanswered-thread aging +
+    # expertise matches for this city's configured expertise_tags.
+    extras = bt.participation_digest(city, cfg)
+    want = bt.expertise_tags(cfg)
+    for entry, item in zip(entries, items):
+        # Inline marker on NEW digest entries too: an open thread from another
+        # city matching our expertise gets flagged where the reader will see it.
+        if (want and item.get("kind") == "thread" and not item.get("accepted")
+                and item.get("city") != bt.city_name(city)):
+            matched = bt.match_expertise(item.get("tags") or [], want)
+            if matched:
+                entry["matched_tags"] = matched
+                entry["note"] = bt.EXPERTISE_NOTE
     if args.consume_as and new_cursor:
         bt.save_cursor(city, args.consume_as, new_cursor)
     head = {
@@ -207,15 +248,23 @@ def cmd_sweep(args) -> int:
         "agent": agent,
         "new_items": len(entries),
         "removed_paths": len(removed),
+        "aging_open_unanswered": extras["aging_total"],
+        "expertise_matches": extras["expertise_total"],
         "cursor": cursor or "(unset)",
         "new_cursor": new_cursor or "",
         "consumed": bool(args.consume_as and new_cursor),
     }
     print(json.dumps(head))
-    if entries or removed:
-        payload = {"digest": entries}
-        if removed:
-            payload["removed"] = removed
+    payload = {}
+    if entries:
+        payload["digest"] = entries
+    if removed:
+        payload["removed"] = removed
+    if extras["aging"]:
+        payload["aging"] = extras["aging"]
+    if extras["expertise_matches"]:
+        payload["expertise_matches"] = extras["expertise_matches"]
+    if payload:
         # The digest hop is third-party content too (§11.3): wrap it.
         print(bt.wrap_untrusted(json.dumps(payload, indent=2, ensure_ascii=False)))
     return 0
@@ -312,6 +361,7 @@ def main() -> int:
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("sync").set_defaults(fn=cmd_sync)
     sub.add_parser("reindex").set_defaults(fn=cmd_reindex)
+    sub.add_parser("ledger").set_defaults(fn=cmd_ledger)
 
     p = sub.add_parser("sweep"); p.set_defaults(fn=cmd_sweep)
     p.add_argument("--agent", default="", help="cursor identity to REPORT against (default mayor)")

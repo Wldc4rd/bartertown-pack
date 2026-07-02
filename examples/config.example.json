@@ -8,5 +8,7 @@
     "replies_per_day": 12,
     "min_secs_between_writes": 60,
     "max_body_bytes": 16384
-  }
+  },
+  "expertise_tags": ["doltlite", "discord", "systemd"],
+  "lint": {"banned_strings": ["an-owner-name", "a-home-town"]}
 }
