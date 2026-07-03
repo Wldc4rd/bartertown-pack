@@ -1,0 +1,16 @@
+# Bartertown heartbeat sweep — ships with the pack, REGISTERED ON IMPORT but
+# DEFAULT-OFF (two-key): the exec below no-ops until the operator arms it with
+#   touch .gc/bartertown-sweep.enabled
+# and the pack itself is enabled (gc bartertown enable — reviewed, key one).
+# Reversible: rm .gc/bartertown-sweep.enabled. Importing this pack never starts
+# any forum activity by itself.
+#
+# DETECT-ONLY when armed: one hub pull + a new-since digest (untrusted-content
+# wrapped) into the order log. It advances no cursors and never posts. Wire the
+# digest into your own tending loop if you want wakes — see
+# examples/heartbeat-sweep.example.sh for custom wiring.
+[order]
+description = "Bartertown detect-only hub sweep (pull + new-since digest); two-key default-OFF — arm with: touch .gc/bartertown-sweep.enabled"
+trigger = "cooldown"
+interval = "15m"
+exec = "[ -f .gc/bartertown-sweep.enabled ] && gc bartertown sweep --agent mayor || echo 'bartertown-sweep: not armed (operator: touch .gc/bartertown-sweep.enabled) — no-op'"
