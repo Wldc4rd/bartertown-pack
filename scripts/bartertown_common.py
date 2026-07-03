@@ -163,6 +163,37 @@ def agent_name() -> str:
     return "shared"
 
 
+def participants(cfg: dict):
+    """Parse config.participants into the wiring scope.
+
+    Returns the string ``"all"`` (every agent is wired) or a normalized set of
+    participant agent names. Accepts ``"all"`` / ``"*"`` (everyone), a single
+    name string, or a list of names. Anything malformed or empty falls back to
+    ``"all"`` — a broken config must never silently HIDE the tools from agents
+    that had them (fail-open to the backward-compatible default)."""
+    raw = cfg.get("participants", "all")
+    if isinstance(raw, str):
+        return "all" if raw.strip().lower() in ("", "all", "*") else {_sanitize_name(raw)}
+    if isinstance(raw, list):
+        names = {_sanitize_name(str(x)) for x in raw if str(x).strip()}
+        return names or "all"
+    return "all"
+
+
+def agent_participates(cfg: dict, agent: str | None = None) -> bool:
+    """True iff the calling agent is wired for Bartertown per config.participants.
+
+    Default ``"all"`` wires every agent (backward-compatible). Operators scope
+    the barter_* tools to specific agents by listing them (e.g.
+    ``"participants": ["mayor"]``): the MCP server then presents NO tools to
+    non-participants, so their prompt carries no barter_* tool definitions."""
+    scope = participants(cfg)
+    if scope == "all":
+        return True
+    who = _sanitize_name(agent) if agent else agent_name()
+    return who in scope
+
+
 # ---------------------------------------------------------------------------
 # Git plumbing — scoped to the forum clone, guarded by the manifest
 # ---------------------------------------------------------------------------

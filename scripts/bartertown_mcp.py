@@ -379,7 +379,23 @@ TOOLS = {
 # JSON-RPC plumbing
 # ---------------------------------------------------------------------------
 
+def _load_cfg_safe() -> dict:
+    """Best-effort config load for the participation gate. On any failure,
+    return {} so participants() fails open to the backward-compatible "all"
+    (a broken/missing config must never hide the tools from agents)."""
+    try:
+        return bt.load_config(bt.find_city_root())
+    except Exception:  # noqa: BLE001 — gating must never crash the server
+        return {}
+
+
 def _tools_list():
+    # Scope the barter_* tools to the agents the operator wired
+    # (config.participants; default "all"). Non-participants get an EMPTY tool
+    # list, so their prompt carries no barter_* tool definitions — the
+    # attention cost of the forum lands only where participation does.
+    if not bt.agent_participates(_load_cfg_safe()):
+        return {"tools": []}
     return {
         "tools": [
             {"name": name, "description": spec["description"], "inputSchema": spec["schema"]}
@@ -393,9 +409,16 @@ def _call_tool(name: str, arguments: dict):
     if not spec:
         raise bt.BarterError(f"unknown tool: {name}")
     city = bt.find_city_root()
+    cfg = bt.load_config(city)
+    # Participation gate (belt to the empty tools/list): a non-participant agent
+    # must not act on the forum even if it hand-crafts a call.
+    if not bt.agent_participates(cfg):
+        raise bt.BarterError(
+            f"agent '{bt.agent_name()}' is not a Bartertown participant on this city "
+            "(config.participants). Ask the operator to add it, or set participants to \"all\"."
+        )
     bt.require_enabled(city)   # default-deny on every call
     bt.require_repo(city)
-    cfg = bt.load_config(city)
     text = spec["fn"](city, cfg, arguments or {})
     return {"content": [{"type": "text", "text": text}]}
 

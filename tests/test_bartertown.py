@@ -82,6 +82,13 @@ class FakeCity:
         cfgp.parent.mkdir(parents=True, exist_ok=True)
         cfgp.write_text(json.dumps(cfg, indent=2))
 
+    def set_config(self, **kw):
+        cfgp = self.root / bt.SERVICE_DIR / "config.json"
+        cfg = json.loads(cfgp.read_text()) if cfgp.is_file() else {}
+        cfg.update(kw)
+        cfgp.parent.mkdir(parents=True, exist_ok=True)
+        cfgp.write_text(json.dumps(cfg, indent=2))
+
     def repo_git(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(self.root / bt.SERVICE_DIR / "repo"), *args],
                               capture_output=True, text=True)
@@ -933,6 +940,76 @@ class TestCloneConfinement(unittest.TestCase):
         pid, path = bt.write_post(self.city.root, tid, "a normal reply", "me")
         self.assertTrue(path.is_file())
         self.assertTrue(bt._within_clone(self.repo, path))
+
+
+class TestParticipantScope(unittest.TestCase):
+    """hs-akbjk — config.participants scopes WHICH agents get the barter_* tools.
+
+    The MCP server is projected into every agent by gc, but presents tools only
+    to configured participants: a non-participant's tools/list is EMPTY (no
+    prompt-attention cost) and any hand-crafted call is refused."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bt-test-scope-"))
+        cls.hub = str(cls.tmp / "hub" / "bartertown.git")
+        cls.city = FakeCity(cls.tmp / "cityS", "citys")
+        r = cls.city.admin("init", "--city", "citys", "--hub", cls.hub, "--create-hub")
+        assert r.returncode == 0, r.stderr + r.stdout
+        cls.city.enable()
+        cls.city.set_budgets(min_secs_between_writes=0)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _tool_names(self, agent):
+        cli = MCPClient(self.city, agent=agent)
+        try:
+            return sorted(t["name"] for t in cli.request("tools/list")["result"]["tools"])
+        finally:
+            cli.close()
+
+    def test_01_default_wires_every_agent(self):
+        self.city.set_config(participants="all")
+        self.assertEqual(len(self._tool_names("random-agent")), 7, "default all: every agent sees the tools")
+
+    def test_02_absent_key_is_backward_compatible_all(self):
+        # remove the key entirely -> behaves as "all"
+        cfgp = self.city.root / bt.SERVICE_DIR / "config.json"
+        cfg = json.loads(cfgp.read_text()); cfg.pop("participants", None)
+        cfgp.write_text(json.dumps(cfg))
+        self.assertEqual(len(self._tool_names("random-agent")), 7, "no key = all (no regression)")
+
+    def test_03_scoped_list_hides_tools_from_non_participant(self):
+        self.city.set_config(participants=["mayor"])
+        self.assertEqual(self._tool_names("artificer"), [], "non-participant: EMPTY tools/list")
+        self.assertEqual(len(self._tool_names("mayor")), 7, "participant: full tools/list")
+
+    def test_04_non_participant_call_is_refused(self):
+        self.city.set_config(participants=["mayor"])
+        cli = MCPClient(self.city, agent="artificer")
+        try:
+            text, is_err = cli.call("barter_search", {"query": "x"})
+            self.assertTrue(is_err)
+            self.assertIn("not a Bartertown participant", text)
+        finally:
+            cli.close()
+
+    def test_05_participant_call_works(self):
+        self.city.set_config(participants=["mayor"])
+        cli = MCPClient(self.city, agent="mayor")
+        try:
+            text, is_err = cli.call("barter_search", {"query": "nothing yet"})
+            self.assertFalse(is_err, text)
+        finally:
+            cli.close()
+
+    def test_06_broken_participants_fails_open(self):
+        # a malformed value must never silently hide the tools
+        self.city.set_config(participants=12345)
+        self.assertEqual(len(self._tool_names("anyone")), 7, "malformed config fails open to all")
+        self.city.set_config(participants="all")  # restore
 
 
 if __name__ == "__main__":
