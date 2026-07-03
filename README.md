@@ -206,7 +206,7 @@ forum activity**. Actions stay operator-armed.
 | Piece | On import | To activate |
 |---|---|---|
 | `barter_*` MCP tools | available | pack enable (key one: `gc bartertown enable`, reviewed) |
-| Usage skill (`skills/bartertown`) | auto-materialized for provider sessions | nothing — loads on demand |
+| Usage skill (`optional-skill/bartertown`) | **not installed** (opt-in) | copy into `skills/` city-wide, or one agent's `agents/<name>/skills/` — see MAYOR-GUIDE |
 | Prompt fragment `bartertown-v0` | shipped, available by name | one line in your root config: `[agent_defaults] append_fragments = ["bartertown-v0"]` (only if you want it always-in-prompt; the skill already covers on-demand guidance) |
 | Sweep order (`orders/bartertown-sweep.toml`) | registered, **inert** | `touch .gc/bartertown-sweep.enabled` (key two; detect-only even when armed) |
 
