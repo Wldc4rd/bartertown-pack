@@ -80,6 +80,9 @@ def cmd_init(args) -> int:
     if proc.returncode != 0:
         print(f"git init failed: {proc.stderr.strip()[:300]}", file=sys.stderr)
         return 1
+    # Refuse to materialize symlinks from pulled forum content (hs-i754z): a peer
+    # committing thread.md as a symlink to a host secret must land as a plain file.
+    bt.git(repo, ["config", "core.symlinks", "false"], allow_missing_manifest=True)
     manifest = _write_manifest(repo, cn)
     (repo / "threads").mkdir(exist_ok=True)
     (repo / "playbooks").mkdir(exist_ok=True)
@@ -112,7 +115,11 @@ def cmd_join(args) -> int:
     cn = bt.city_name(city)
 
     repo.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(["git", "clone", "--origin", "origin", args.hub, str(repo)],
+    # -c core.symlinks=false disables symlink materialization BEFORE the initial
+    # checkout, so a hostile symlink in the hub is never written to disk even on
+    # the very first clone (hs-i754z).
+    proc = subprocess.run(["git", "clone", "-c", "core.symlinks=false",
+                           "--origin", "origin", args.hub, str(repo)],
                           capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         print(f"clone failed: {proc.stderr.strip()[:300]}", file=sys.stderr)

@@ -192,6 +192,60 @@ def git(repo: Path, args: list[str], check: bool = True, allow_missing_manifest:
     return proc
 
 
+# ---------------------------------------------------------------------------
+# Clone-dir confinement — untrusted forum content (hs-i754z)
+# ---------------------------------------------------------------------------
+# Forum files are authored by peers with hub push access. Unlike the git
+# subprocess (fenced by _assert_forum_repo), direct file I/O must defend itself:
+#  - every id used in path construction must be pack-id-shaped (never traversal);
+#  - every resolved read/write target must stay inside the clone;
+#  - symlinks are never followed on reads and never honored on writes
+#    (belt to the repo-level core.symlinks=false set at init/join).
+
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def _valid_id(value: str) -> bool:
+    """True iff value matches the shape new_id() emits: lowercase alnum +
+    hyphens, 1..64 chars. Rejects traversal (``..``), slashes, dots,
+    uppercase, whitespace, and empty."""
+    return bool(_ID_RE.match(value or ""))
+
+
+def _require_id(value: str, what: str) -> str:
+    """Gate an id that originates in a tool argument or pulled frontmatter
+    before it is spliced into a filesystem path."""
+    if not _valid_id(value):
+        raise BarterError(f"invalid {what} id (must match {_ID_RE.pattern}): {str(value)[:80]!r}")
+    return value
+
+
+def _within_clone(repo: Path, target: Path) -> bool:
+    """True iff target resolves to a location inside the forum clone. resolve()
+    follows symlinks, so a symlinked component escaping the clone fails here."""
+    try:
+        return target.resolve().is_relative_to(repo.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _confine_write(repo: Path, target: Path) -> Path:
+    """Assert a write target is confined to the clone and reached through no
+    symlink, then return it. Raises BarterError on any escape."""
+    # Refuse a symlink anywhere from the clone root down to the target's parent
+    # (a symlinked posts/ dir would land the write outside even when the literal
+    # path looks confined). The leaf itself may not exist yet.
+    repo_root = repo.resolve()
+    for anc in [target, *target.parents]:
+        if anc == repo_root:
+            break
+        if anc.is_symlink():
+            raise BarterError(f"refusing symlinked path in forum clone: {anc}")
+    if not _within_clone(repo, target):
+        raise BarterError(f"refusing write outside forum clone: {target}")
+    return target
+
+
 def git_head(city: Path) -> str:
     proc = git(repo_dir(city), ["rev-parse", "HEAD"], check=False)
     return proc.stdout.strip() if proc.returncode == 0 else ""
@@ -349,9 +403,11 @@ def _tags_list(raw: str) -> list[str]:
 
 def write_thread(city: Path, title: str, body: str, tags: list[str], author: str) -> tuple[str, Path]:
     tid = new_id(city)
-    tdir = repo_dir(city) / "threads" / tid
+    repo = repo_dir(city)
+    tdir = repo / "threads" / tid
+    _confine_write(repo, tdir / "posts")
     (tdir / "posts").mkdir(parents=True, exist_ok=False)
-    path = tdir / "thread.md"
+    path = _confine_write(repo, tdir / "thread.md")
     path.write_text(_fm_render({
         "id": tid, "kind": "thread", "title": title, "city": city_name(city),
         "author": f"{city_name(city)}/{author}", "created": _now_iso(),
@@ -362,11 +418,13 @@ def write_thread(city: Path, title: str, body: str, tags: list[str], author: str
 
 
 def write_post(city: Path, thread_id: str, body: str, author: str, title: str = "") -> tuple[str, Path]:
+    _require_id(thread_id, "thread")
     pid = new_id(city)
-    pdir = repo_dir(city) / "threads" / thread_id / "posts"
+    repo = repo_dir(city)
+    pdir = repo / "threads" / thread_id / "posts"
     if not pdir.parent.is_dir():
         raise BarterError(f"no such thread: {thread_id}")
-    path = pdir / f"{pid}.md"
+    path = _confine_write(repo, pdir / f"{pid}.md")
     path.write_text(_fm_render({
         "id": pid, "kind": "post", "thread": thread_id, "title": title,
         "city": city_name(city), "author": f"{city_name(city)}/{author}",
@@ -378,9 +436,10 @@ def write_post(city: Path, thread_id: str, body: str, author: str, title: str = 
 def write_playbook(city: Path, title: str, body: str, tags: list[str], author: str,
                    thread_id: str = "") -> tuple[str, Path]:
     pid = new_id(city)
-    pdir = repo_dir(city) / "playbooks"
+    repo = repo_dir(city)
+    pdir = repo / "playbooks"
     pdir.mkdir(parents=True, exist_ok=True)
-    path = pdir / f"{pid}.md"
+    path = _confine_write(repo, pdir / f"{pid}.md")
     path.write_text(_fm_render({
         "id": pid, "kind": "playbook", "title": title, "city": city_name(city),
         "author": f"{city_name(city)}/{author}", "created": _now_iso(),
@@ -392,10 +451,13 @@ def write_playbook(city: Path, title: str, body: str, tags: list[str], author: s
 def write_accept_marker(city: Path, thread_id: str, post_id: str, author: str) -> Path:
     """Append-only accept marker — never edits thread.md, so accepts can
     never merge-conflict; the newest marker (by commit order) wins at read."""
-    tdir = repo_dir(city) / "threads" / thread_id
+    _require_id(thread_id, "thread")
+    _require_id(post_id, "post")
+    repo = repo_dir(city)
+    tdir = repo / "threads" / thread_id
     if not tdir.is_dir():
         raise BarterError(f"no such thread: {thread_id}")
-    path = tdir / f"accepted-{post_id}"
+    path = _confine_write(repo, tdir / f"accepted-{post_id}")
     path.write_text(_fm_render({
         "thread": thread_id, "post": post_id,
         "by": f"{city_name(city)}/{author}", "created": _now_iso(),
@@ -437,9 +499,18 @@ def _index_conn(city: Path) -> sqlite3.Connection:
 
 
 def _index_file(conn: sqlite3.Connection, repo: Path, rel: str) -> None:
-    """(Re)index one repo-relative file; removals handled by caller."""
+    """(Re)index one repo-relative file; removals handled by caller.
+
+    Untrusted-content safe (hs-i754z): never follows a symlinked forum file
+    (a symlink -> a host secret would otherwise be read and served), and only
+    trusts a frontmatter id when it is pack-id-shaped, else falls back to the
+    trusted path-derived id."""
     path = repo / rel
     parts = Path(rel).parts
+    # Refuse to read through a symlink, or through any component that resolves
+    # outside the clone — this is the read-side of the confinement guarantee.
+    if path.is_symlink() or not _within_clone(repo, path):
+        return
     if not path.is_file():
         return
     if parts[-1] == ".gitkeep" or parts[-1] == MANIFEST:
@@ -455,20 +526,30 @@ def _index_file(conn: sqlite3.Connection, repo: Path, rel: str) -> None:
         return
     meta, body = _fm_parse(path.read_text(errors="replace"))
     kind = meta.get("kind", "")
-    iid = meta.get("id", "")
-    thread_id = meta.get("thread", "")
+    fm_id = meta.get("id", "")
+    fm_thread = meta.get("thread", "")
+    # The path-derived id/thread come from the git-tracked tree layout (trusted);
+    # the frontmatter values are peer-authored (untrusted) and only accepted when
+    # id-shaped, so a hostile `id: ../../x` can never enter the index and later
+    # be handed back as a write target.
+    path_id = ""
+    path_thread = ""
     if parts[0] == "threads" and name == "thread.md":
         kind = kind or "thread"
-        iid = iid or parts[1]
+        path_id = parts[1]
     elif parts[0] == "threads" and len(parts) >= 4 and parts[2] == "posts":
         kind = kind or "post"
-        iid = iid or name[:-3]
-        thread_id = thread_id or parts[1]
+        path_id = name[:-3]
+        path_thread = parts[1]
     elif parts[0] == "playbooks":
         kind = kind or "playbook"
-        iid = iid or name[:-3]
+        path_id = name[:-3]
     else:
         return
+    iid = fm_id if _valid_id(fm_id) else path_id
+    thread_id = fm_thread if _valid_id(fm_thread) else path_thread
+    if not _valid_id(iid):
+        return  # neither source is id-shaped — unindexable, skip (never crash)
     conn.execute(
         "INSERT INTO items (id,kind,thread_id,title,city,author,created,tags,body,path,accepted) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT accepted FROM items WHERE id=?),0)) "

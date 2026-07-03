@@ -833,5 +833,107 @@ class TestParticipationAndLedger(unittest.TestCase):
         self.assertIn("disabled", r.stderr + r.stdout)
 
 
+class TestCloneConfinement(unittest.TestCase):
+    """hs-i754z — untrusted forum content cannot escape the clone dir.
+
+    Mirrors the intent of TestGatesAndProtocol.test_04 (git guard) for the
+    direct-file-I/O paths: a hostile peer who commits a traversal id or a
+    symlinked file/dir to the hub must not read a host secret or write outside
+    the clone. Each case proves the exploit is REFUSED (red/green)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bt-test-confine-"))
+        cls.hub = str(cls.tmp / "hub" / "bartertown.git")
+        cls.city = FakeCity(cls.tmp / "cityC", "cityc")
+        r = cls.city.admin("init", "--city", "cityc", "--hub", cls.hub, "--create-hub")
+        assert r.returncode == 0, r.stderr + r.stdout
+        cls.city.enable()
+        cls.city.set_budgets(min_secs_between_writes=0)
+        cls.repo = cls.city.root / bt.SERVICE_DIR / "repo"
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    # --- (a) id sanitation: a traversal thread_id is refused at the write boundary
+    def test_01_write_post_rejects_traversal_thread_id(self):
+        with self.assertRaises(bt.BarterError) as cm:
+            bt.write_post(self.city.root, "../../../../tmp/evil", "body", "attacker")
+        self.assertIn("invalid thread id", str(cm.exception))
+
+    def test_02_accept_marker_rejects_traversal_ids(self):
+        with self.assertRaises(bt.BarterError):
+            bt.write_accept_marker(self.city.root, "../../etc", "../../passwd", "attacker")
+
+    # --- (a) index-time: a hostile frontmatter id never enters the index
+    def test_03_index_ignores_malicious_frontmatter_id(self):
+        tid, _ = bt.write_thread(self.city.root, "legit", "hello world", ["x"], "me")
+        # tamper: overwrite the just-written thread.md with a traversal id in fm,
+        # then COMMIT it (the realistic path: a peer pushes it to the hub and we
+        # pull it, so git ls-files tracks it and _index_file runs against it).
+        tpath = self.repo / "threads" / tid / "thread.md"
+        tpath.write_text("---\nid: ../../../evil\nkind: thread\ntitle: t\n---\nbody\n")
+        self.city.repo_git("add", "-A")
+        self.city.repo_git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "tamper")
+        bt.rebuild_index(self.city.root)
+        conn = bt._index_conn(self.city.root)
+        try:
+            ids = [r["id"] for r in conn.execute("SELECT id FROM items").fetchall()]
+        finally:
+            conn.close()
+        self.assertNotIn("../../../evil", ids, "traversal frontmatter id must not be stored")
+        self.assertIn(tid, ids, "falls back to the trusted path-derived id")
+
+    # --- (c) read-side: a symlinked thread.md is never followed to a host secret
+    def test_04_symlinked_thread_md_is_not_read(self):
+        secret = self.tmp / "host-secret.txt"
+        secret.write_text("TOP-SECRET-HOST-KEY-abc123")
+        tdir = self.repo / "threads" / "cityc-evil-0001"
+        (tdir / "posts").mkdir(parents=True, exist_ok=True)
+        link = tdir / "thread.md"
+        os.symlink(secret, link)
+        self.assertTrue(link.is_symlink())
+        # commit the symlink (git stores it as a symlink object) so ls-files
+        # tracks it and _index_file runs — exercising the is_symlink read guard.
+        self.city.repo_git("add", "-A")
+        self.city.repo_git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "sym")
+        bt.rebuild_index(self.city.root)
+        conn = bt._index_conn(self.city.root)
+        try:
+            bodies = " ".join(r["body"] for r in conn.execute("SELECT body FROM items").fetchall())
+        finally:
+            conn.close()
+        self.assertNotIn("TOP-SECRET-HOST-KEY", bodies, "symlinked file content must never be indexed/served")
+
+    # --- (c) write-side: a symlinked posts/ dir cannot redirect a reply outside
+    def test_05_symlinked_posts_dir_write_refused(self):
+        outside = self.tmp / "outside"
+        outside.mkdir(exist_ok=True)
+        tid = "cityc-symdir-0002"
+        tdir = self.repo / "threads" / tid
+        tdir.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside, tdir / "posts")  # posts/ -> outside the clone
+        with self.assertRaises(bt.BarterError) as cm:
+            bt.write_post(self.city.root, tid, "reply body", "attacker")
+        msg = str(cm.exception).lower()
+        self.assertTrue("symlink" in msg or "outside forum clone" in msg, msg)
+        # and nothing was written into the outside dir
+        self.assertEqual(list(outside.iterdir()), [], "write must not land outside the clone")
+
+    # --- (c) repo config carries the symlink defense after init
+    def test_06_init_sets_core_symlinks_false(self):
+        proc = subprocess.run(["git", "-C", str(self.repo), "config", "--get", "core.symlinks"],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.stdout.strip(), "false")
+
+    # --- green path: a normal reply on a real thread still works end-to-end
+    def test_07_legit_reply_still_writes(self):
+        tid, _ = bt.write_thread(self.city.root, "real", "real body", ["ok"], "me")
+        pid, path = bt.write_post(self.city.root, tid, "a normal reply", "me")
+        self.assertTrue(path.is_file())
+        self.assertTrue(bt._within_clone(self.repo, path))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
